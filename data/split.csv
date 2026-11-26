@@ -7667,7 +7667,7 @@ Irzv8D150RE,Organized Chaos,Entertainment,-4.435847883737776,0,1,val
 IsAGl0hkQIE,PetiteDiva TV,Howto & Style,-1.470901460408393,1,1,val
 IsXC0c-jBzY,LA Kings,Sports,-3.9665819896785806,0,7,train
 IshyFADSvFc,The Skid Factory,Autos & Vehicles,-0.8362178048770073,1,2,train
-IskUCoxucM4,Ankaka,News & Politics,3.2259525116636882,python -m src.cv.train --experiment convnext_tiny \,9,train
+IskUCoxucM4,Ankaka,News & Politics,3.2259525116636882,1,9,train
 Ispi7BFhXJg,Grenoble Ecole de Management,Education,-6.890363536270268,0,3,train
 IsrOk8hA7E8,6abc Philadelphia,News & Politics,-5.1793515986426035,0,5,train
 It-qDeu2LQ4,John M. Phillips,News & Politics,-8.584851839890053,0,8,train
