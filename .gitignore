@@ -1,0 +1,5 @@
+out/
+thumbs/
+*.npy
+youtube_dataset_local_images.csv
+valid_images.csv
