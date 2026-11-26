@@ -6790,7 +6790,7 @@ GdkaY5-2CPA,applelover53,Howto & Style,-5.345495926823127,0,6,train
 GdmLMaH7Zdo,Unnatural Vegan,People & Blogs,-2.9095545773129388,1,2,train
 GdtxRppsmlo,Cricket South Africa,Sports,-4.990319056105683,0,5,train
 GeG2efJWM2g,hOlyhexOr,Gaming,-4.263453964720699,0,2,train
-GeHSeD2b8d8,Prime Minister's Office of Japan,News & Politics,2.284689555137148,  --images-dir /path/to/thumbnails \,1,val
+GeHSeD2b8d8,Prime Minister's Office of Japan,News & Politics,2.284689555137148,1,1,val
 GeMV4sE_fQU,Avenues Khabar,News & Politics,-7.299916421463939,0,8,train
 GedxB0mmw8M,euronews,News & Politics,-7.58512795228825,0,5,train
 GehQiDuETPM,Wikitongues,Nonprofits & Activism,-4.63395901446526,0,3,train
@@ -12715,7 +12715,7 @@ WHS8JTbnp-g,Martial Mind,Gaming,-3.8099598455435144,0,0,test
 WHUecM0vbrE,Company of Heroes,Gaming,-1.8758641238895322,1,4,train
 WHXaR7c7krg,TOI Sports,Sports,-7.306950774076706,0,1,val
 WI8kmsZe-IM,Nanogenix,Gaming,-3.0716712916790594,1,6,train
-WI9fbbQ-aTo,FOX 9 Minneapolis-St. Paul,News & Politics,2.688343219959442,  --splits-csv /path/to/splits.csv \,2,train
+WI9fbbQ-aTo,FOX 9 Minneapolis-St. Paul,News & Politics,2.688343219959442,1,2,train
 WIDkbjwNiNk,Farm Aid,Music,-6.376952492619759,0,6,train
 WIHsHksWXQQ,Mkn P,Gaming,-5.9668563333867155,0,7,train
 WIcJt6DcN2s,Secular Talk,News & Politics,-3.242328856791528,1,8,train
@@ -16223,7 +16223,7 @@ eMY-NcYdl1g,PrettyNflawed,People & Blogs,-2.6225332735794473,1,6,train
 eNWWvzpQlV0,Microsoft Events,Science & Technology,-6.314093649636997,0,0,test
 eO6Aup7YRus,WANE 15 News,Sports,-5.724026080932847,0,9,train
 eOiGM1S5ArM,QubeTV Telugu,Entertainment,-4.4442567112100155,0,9,train
-eOmV6zdrImo,Universal Pictures Australia,Entertainment,2.1111385435607017,  --output-dir outputs/convnext_tiny,2,train
+eOmV6zdrImo,Universal Pictures Australia,Entertainment,2.1111385435607017,1,2,train
 eOqpOLBZJHo,The Daily Signal,News & Politics,-2.99974029495153,1,1,val
 eOvAHsTQIXo,SPORTSNET,Sports,-5.823671090876937,0,4,train
 eOxZsLuXqFw,Voice2Hard Music & Film Productions,Music,-4.617785873330305,0,2,train
