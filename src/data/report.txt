@@ -1,0 +1,50 @@
+initial rows: 26524
+non-monotonic rows (fixed with running max): 3064
+dropped for a drop > 20%: 73
+dropped for day19 == 0: 12
+dropped for missing/invalid thumbnail: 1962
+final: 24477 videos, 11505 channels
+
+y_top threshold (75th percentile on train): -3.385
+
+split sizes:
+split
+train    19580
+val       2449
+test      2448
+
+y per split:
+         count   mean    std
+split                       
+test    2448.0 -4.779  2.031
+train  19580.0 -4.891  2.056
+val     2449.0 -4.978  2.070
+
+share of y_top per split:
+split
+test     0.258
+train    0.250
+val      0.244
+
+channels appearing in more than one split: 0 (must be 0)
+
+category share per split:
+split                   test  train    val
+category                                  
+Autos & Vehicles       0.025  0.025  0.026
+Comedy                 0.011  0.011  0.011
+Education              0.060  0.060  0.060
+Entertainment          0.185  0.185  0.185
+Film & Animation       0.026  0.026  0.026
+Gaming                 0.153  0.153  0.153
+Howto & Style          0.047  0.047  0.047
+Music                  0.067  0.067  0.067
+News & Politics        0.217  0.217  0.216
+Nonprofits & Activism  0.011  0.012  0.012
+People & Blogs         0.064  0.063  0.063
+Pets & Animals         0.007  0.007  0.007
+Science & Technology   0.036  0.036  0.036
+Sports                 0.079  0.079  0.079
+Travel & Events        0.013  0.013  0.013
+
+correlation of log(subscribers) with log(day19): 0.529; with y: -0.203

@@ -1,0 +1,40 @@
+experiments:
+  baseline_cnn:
+    model_name: efficientnet_b0
+    img_size: 224
+    batch_size: 32
+    lr: 0.0003
+    epochs: 15
+    seed: 42
+    use_hflip: false
+    notes: "Baseline CNN on Kaggle GPU (Part 2)"
+
+  finetuning_vit:
+    model_name: vit_base_patch16_224
+    img_size: 224
+    batch_size: 16
+    lr: 0.0001
+    epochs: 12
+    seed: 42
+    use_hflip: false
+    notes: "Fine-tuning Vision Transformer on Kaggle GPU (Part 2)"
+
+  convnext_tiny:
+    model_name: convnext_tiny
+    img_size: 224
+    batch_size: 32
+    lr: 0.0002
+    epochs: 15
+    seed: 42
+    use_hflip: false
+    notes: "Modern CNN (ConvNeXt-Tiny) on Kaggle GPU"
+
+  finetuning_siglip:
+    model_name: vit_base_patch16_siglip_224
+    img_size: 224
+    batch_size: 16
+    lr: 0.00005
+    epochs: 12
+    seed: 42
+    use_hflip: false
+    notes: "Fine-tuning Vision-Language SigLIP backbone on Kaggle GPU"
