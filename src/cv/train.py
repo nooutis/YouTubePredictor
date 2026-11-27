@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
+import time
 from typing import Optional
 
 import numpy as np
@@ -12,8 +14,18 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from src.cv.config import CVConfig, DEFAULT_EXPERIMENTS_YAML, seed_everything
-from src.cv.dataset import ThumbnailDataset, build_transforms, resolve_normalization
+from src.cv.config import (
+    CVConfig,
+    DEFAULT_EXPERIMENTS_YAML,
+    resolve_torch_device,
+    seed_everything,
+)
+from src.cv.dataset import (
+    ThumbnailDataset,
+    build_transforms,
+    build_vocab,
+    resolve_normalization,
+)
 from src.cv.model import ThumbnailRegressor
 
 
@@ -82,6 +94,21 @@ def _set_backbone_trainable(model: ThumbnailRegressor, trainable: bool) -> None:
         param.requires_grad = trainable
 
 
+def _cosine_warmup_lambda(
+    epoch_idx: int, total_epochs: int, delay_epochs: int, warmup_epochs: int
+) -> float:
+    """Compute LR multiplier with optional freeze delay, linear warmup, and cosine decay."""
+    if epoch_idx < delay_epochs:
+        return 0.0
+    active_epoch = epoch_idx - delay_epochs
+    active_total = max(total_epochs - delay_epochs, 1)
+    if warmup_epochs > 0 and active_epoch < warmup_epochs:
+        return float(active_epoch + 1) / float(warmup_epochs)
+    decay_total = max(active_total - warmup_epochs, 1)
+    progress = min(max(active_epoch - warmup_epochs, 0) / float(decay_total), 1.0)
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -91,17 +118,24 @@ def train_one_epoch(
     y_mean: float = 0.0,
     y_std: float = 1.0,
     scaler: Optional[torch.amp.GradScaler] = None,
+    xm: object | None = None,
+    grad_clip_norm: float = 1.0,
+    log_interval: Optional[int] = None,
 ) -> float:
     """Run one training epoch and return the sample-weighted average total loss."""
     model.train()
-    running_loss = 0.0
+    running_loss_t = torch.zeros((), dtype=torch.float32, device=device)
     total_samples = 0
+    num_batches = max(len(loader), 1)
+    step_log = log_interval or max(1, num_batches // 4)
+    t0 = time.perf_counter()
 
-    for images, targets, _, channel_idx, category_idx in loader:
-        images = images.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-        channel_idx = channel_idx.to(device, non_blocking=True)
-        category_idx = category_idx.to(device, non_blocking=True)
+    for step, (images, targets, _, channel_idx, category_idx) in enumerate(loader, start=1):
+        if xm is None:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            channel_idx = channel_idx.to(device, non_blocking=True)
+            category_idx = category_idx.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -110,19 +144,36 @@ def train_one_epoch(
                 preds = model(images, channel_idx=channel_idx, category_idx=category_idx)
                 loss, _, _ = criterion(preds, targets, y_mean=y_mean, y_std=y_std)
             scaler.scale(loss).backward()
+            if grad_clip_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
             preds = model(images, channel_idx=channel_idx, category_idx=category_idx)
             loss, _, _ = criterion(preds, targets, y_mean=y_mean, y_std=y_std)
             loss.backward()
-            optimizer.step()
+            if grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            if xm is not None:
+                xm.optimizer_step(optimizer, barrier=True)  # type: ignore[attr-defined]
+            else:
+                optimizer.step()
 
         batch_size = images.size(0)
-        running_loss += loss.item() * batch_size
+        running_loss_t = running_loss_t + loss.detach() * batch_size
         total_samples += batch_size
 
-    return running_loss / max(total_samples, 1)
+        # Sync loss to host only at log intervals to avoid per-step XLA graph stalls.
+        if step % step_log == 0 or step == num_batches:
+            elapsed = time.perf_counter() - t0
+            avg_so_far = float(running_loss_t.item()) / max(total_samples, 1)
+            print(
+                f"  [train] batch {step:>4d}/{num_batches} | "
+                f"loss={avg_so_far:.4f} | {elapsed:.1f}s"
+            )
+
+    return float(running_loss_t.item()) / max(total_samples, 1)
 
 
 @torch.no_grad()
@@ -133,6 +184,7 @@ def validate(
     device: torch.device,
     y_mean: float = 0.0,
     y_std: float = 1.0,
+    xm: object | None = None,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     """Evaluate the model on validation and return metrics plus unstandardized predictions."""
     model.eval()
@@ -149,13 +201,16 @@ def validate(
     records: list[dict[str, float | str]] = []
 
     for images, targets, video_ids, channel_idx, category_idx in loader:
-        images = images.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-        channel_idx = channel_idx.to(device, non_blocking=True)
-        category_idx = category_idx.to(device, non_blocking=True)
+        if xm is None:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            channel_idx = channel_idx.to(device, non_blocking=True)
+            category_idx = category_idx.to(device, non_blocking=True)
 
         preds = model(images, channel_idx=channel_idx, category_idx=category_idx)
         loss, reg_loss, cls_loss = criterion(preds, targets, y_mean=y_mean, y_std=y_std)
+        if xm is not None:
+            xm.mark_step()  # type: ignore[attr-defined]
 
         probs_top = torch.sigmoid(preds[:, 1])
         pred_labels = (probs_top >= 0.5).float()
@@ -210,7 +265,7 @@ def validate(
 def run_training(config: CVConfig) -> tuple[Path, Path]:
     """Run the full training loop and save the best weights and validation CSV."""
     seed_everything(config.seed)
-    device = torch.device(config.device)
+    device, xm = resolve_torch_device(config.device)
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
     norm_mean, norm_std = resolve_normalization(config.model_name)
@@ -233,6 +288,12 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
         category_col=config.category_col,
         target_cols=config.target_cols,
     )
+    # Apply min_freq filtering to channel_vocab so rare channels train the <UNK> embedding.
+    if config.channel_col in train_ds.df.columns and config.channel_min_freq > 1:
+        train_ds.channel_vocab = build_vocab(
+            train_ds.df[config.channel_col], min_freq=config.channel_min_freq
+        )
+
     # Reuse train vocabularies on validation to avoid data leakage.
     val_ds = ThumbnailDataset(
         splits_csv=config.splits_csv,
@@ -270,20 +331,28 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
             pos_weight_tensor = torch.tensor([n_neg / n_pos], dtype=torch.float32, device=device)
 
     pin_memory = device.type == "cuda"
-    train_loader = DataLoader(
+    train_loader: DataLoader = DataLoader(
         train_ds,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=pin_memory,
     )
-    val_loader = DataLoader(
+    val_loader: DataLoader = DataLoader(
         val_ds,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
         pin_memory=pin_memory,
     )
+    if xm is not None:
+        try:
+            from torch_xla.distributed.parallel_loader import MpDeviceLoader  # type: ignore[import-not-found]
+
+            train_loader = MpDeviceLoader(train_loader, device)
+            val_loader = MpDeviceLoader(val_loader, device)
+        except Exception:
+            pass
 
     model = ThumbnailRegressor(
         model_name=config.model_name,
@@ -313,22 +382,44 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
         ],
         weight_decay=config.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.epochs
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=[
+            lambda ep: _cosine_warmup_lambda(
+                ep, config.epochs, config.freeze_epochs, config.warmup_epochs
+            ),
+            lambda ep: _cosine_warmup_lambda(ep, config.epochs, 0, config.warmup_epochs),
+        ],
     )
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
     if config.freeze_epochs > 0:
         _set_backbone_trainable(model, False)
 
+    pos_w_val = float(pos_weight_tensor.item()) if pos_weight_tensor is not None else 1.0
+    print(
+        f"[Config] model={config.model_name} | device={device} (xla={xm is not None}) | "
+        f"img={config.img_size} | bs={config.batch_size} | epochs={config.epochs} | "
+        f"train={len(train_ds)} | val={len(val_ds)} | channels={len(train_ds.channel_vocab)} "
+        f"(min_freq={config.channel_min_freq}) | categories={len(train_ds.category_vocab)} | "
+        f"y_mean={y_mean:.3f} y_std={y_std:.3f} | pos_weight={pos_w_val:.2f} | "
+        f"freeze={config.freeze_epochs} warmup={config.warmup_epochs} patience={config.early_stopping_patience}"
+    )
+
     best_val_loss = float("inf")
+    epochs_no_improve = 0
     best_weights_path = config.output_dir / "best_model.pt"
     best_preds_path = config.output_dir / "val_predictions.csv"
 
     for epoch in range(1, config.epochs + 1):
+        epoch_t0 = time.perf_counter()
         if config.freeze_epochs > 0 and epoch == config.freeze_epochs + 1:
             _set_backbone_trainable(model, True)
-            print(f"Epoch {epoch:02d}: Unfreezing backbone with lr={config.lr * config.backbone_lr_mult:.2e}")
+            print(
+                f"Epoch {epoch:02d}: Unfreezing backbone with "
+                f"backbone_lr={optimizer.param_groups[0]['lr']:.2e}, "
+                f"head_lr={optimizer.param_groups[1]['lr']:.2e}"
+            )
 
         train_loss = train_one_epoch(
             model,
@@ -339,22 +430,30 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
             y_mean=y_mean,
             y_std=y_std,
             scaler=scaler,
+            xm=xm,
+            grad_clip_norm=config.grad_clip_norm,
         )
         metrics, val_preds_df = validate(
-            model, val_loader, criterion, device, y_mean=y_mean, y_std=y_std
+            model, val_loader, criterion, device, y_mean=y_mean, y_std=y_std, xm=xm
         )
         scheduler.step()
 
         val_loss = metrics["val_loss"]
+        is_best = val_loss < best_val_loss
+        epoch_dt = time.perf_counter() - epoch_t0
         print(
-            f"Epoch {epoch:02d}/{config.epochs:02d} | "
-            f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+            f"Epoch {epoch:02d}/{config.epochs:02d} ({epoch_dt:.1f}s) | "
+            f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} "
+            f"(reg={metrics['val_reg_loss']:.4f}, cls={metrics['val_cls_loss']:.4f}) | "
             f"mae={metrics['val_mae']:.4f} | r={metrics['val_pearson']:.3f} | "
             f"auc={metrics['val_auc']:.3f} | acc={metrics['val_top_acc']:.3f}"
+            + (" | [*] BEST" if is_best else "")
         )
 
-        if val_loss < best_val_loss:
+        if is_best:
             best_val_loss = val_loss
+            epochs_no_improve = 0
+            cpu_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
             torch.save(
                 {
                     "model_name": config.model_name,
@@ -370,13 +469,24 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
                     "y_std": y_std,
                     "norm_mean": list(norm_mean),
                     "norm_std": list(norm_std),
-                    "state_dict": model.state_dict(),
+                    "state_dict": cpu_state,
                     "val_loss": best_val_loss,
                     "epoch": epoch,
                 },
                 best_weights_path,
             )
             val_preds_df.to_csv(best_preds_path, index=False)
+        else:
+            epochs_no_improve += 1
+            if (
+                config.early_stopping_patience > 0
+                and epochs_no_improve >= config.early_stopping_patience
+            ):
+                print(
+                    f"Early stopping at epoch {epoch:02d} "
+                    f"(no val_loss improvement for {epochs_no_improve} epochs)."
+                )
+                break
 
     print(
         f"Training complete. Best val_loss={best_val_loss:.4f} | "
@@ -407,6 +517,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
 
 
@@ -421,6 +532,7 @@ def main() -> None:
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        device=args.device,
     )
     run_training(config)
 

@@ -12,10 +12,18 @@ from src.cv.config import (
     MODEL_NAME,
     SEED,
     CVConfig,
+    default_device,
+    resolve_torch_device,
     seed_everything,
 )
 from src.cv.dataset import ThumbnailDataset, build_transforms
-from src.cv.inference import load_model, predict, predict_thumbnail
+from src.cv.inference import (
+    load_ensemble,
+    load_model,
+    predict,
+    predict_ensemble,
+    predict_thumbnail,
+)
 from src.cv.model import ThumbnailRegressor
 from src.cv.train import run_training, train_one_epoch, validate
 
@@ -30,9 +38,13 @@ __all__ = [
     "ThumbnailDataset",
     "ThumbnailRegressor",
     "build_transforms",
+    "default_device",
+    "load_ensemble",
     "load_model",
     "predict",
+    "predict_ensemble",
     "predict_thumbnail",
+    "resolve_torch_device",
     "run_training",
     "seed_everything",
     "train_one_epoch",

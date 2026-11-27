@@ -9,7 +9,7 @@ from PIL import Image
 import torch
 import torch.nn as nn
 
-from src.cv.config import IMG_SIZE, MODEL_NAME, default_device
+from src.cv.config import IMG_SIZE, MODEL_NAME, default_device, resolve_torch_device
 from src.cv.dataset import (
     IMAGENET_MEAN,
     IMAGENET_STD,
@@ -27,9 +27,9 @@ def load_model(
     device: Optional[str] = None,
 ) -> tuple[nn.Module, int, torch.device]:
     """Load a checkpoint saved by `run_training` and set the model to eval mode."""
-    target_device = torch.device(device or default_device())
-    # weights_only=True restricts loading to tensor data and avoids arbitrary pickle execution.
-    checkpoint = torch.load(weights_path, map_location=target_device, weights_only=True)
+    target_device, _ = resolve_torch_device(device or default_device())
+    # Always map tensors to CPU first so XLA/CUDA checkpoints load reliably everywhere.
+    checkpoint = torch.load(weights_path, map_location="cpu", weights_only=True)
 
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
         resolved_model_name = model_name or checkpoint.get("model_name", MODEL_NAME)
@@ -88,6 +88,16 @@ def load_model(
     return model, resolved_img_size, target_device
 
 
+def load_ensemble(
+    weights_paths: list[str | Path],
+    device: Optional[str] = None,
+) -> list[tuple[nn.Module, int, torch.device]]:
+    """Pre-load multiple fold checkpoints once for fast repeated ensemble inference."""
+    if not weights_paths:
+        raise ValueError("Provide at least one checkpoint path in `weights_paths`.")
+    return [load_model(wp, device=device) for wp in weights_paths]
+
+
 @torch.no_grad()
 def predict_thumbnail(
     image: str | Path | Image.Image,
@@ -108,9 +118,12 @@ def predict_thumbnail(
             device=str(device) if device is not None else None,
         )
     else:
-        target_device = torch.device(
-            device if device is not None else next(model.parameters()).device
-        )
+        if device is None:
+            target_device = next(model.parameters()).device
+        elif isinstance(device, torch.device):
+            target_device = device
+        else:
+            target_device, _ = resolve_torch_device(device)
         model.eval()
 
     if isinstance(image, (str, Path)):
@@ -164,28 +177,48 @@ def predict(
 
 def predict_ensemble(
     image: str | Path | Image.Image,
-    weights_paths: list[str | Path],
+    weights_paths: Optional[list[str | Path]] = None,
+    models: Optional[list[tuple[nn.Module, int, torch.device]]] = None,
+    weights: Optional[list[float]] = None,
     threshold: float = 0.5,
     device: Optional[str] = None,
     channel_title: Optional[str] = None,
     category: Optional[str] = None,
 ) -> dict[str, float | int]:
-    """Average `pred_y` and `pred_y_top` across multiple fold checkpoints."""
-    if not weights_paths:
-        raise ValueError("Provide at least one checkpoint path in `weights_paths`.")
+    """Weighted average of `pred_y` and `pred_y_top` across multiple fold models."""
+    if models is None:
+        if not weights_paths:
+            raise ValueError("Provide either `models` or `weights_paths`.")
+        loaded = load_ensemble(weights_paths, device=device)
+    else:
+        loaded = models
+
+    if not loaded:
+        raise ValueError("Ensemble must contain at least one model.")
+
+    if weights is None:
+        norm_weights = [1.0 / len(loaded)] * len(loaded)
+    else:
+        if len(weights) != len(loaded):
+            raise ValueError("`weights` length must match number of ensemble models.")
+        w_sum = sum(weights)
+        if w_sum <= 0:
+            raise ValueError("Sum of `weights` must be positive.")
+        norm_weights = [float(w) / w_sum for w in weights]
 
     preds = [
         predict_thumbnail(
             image=image,
-            weights_path=wp,
-            device=device,
+            model=m,
+            img_size=sz,
+            device=dev,
             channel_title=channel_title,
             category=category,
         )
-        for wp in weights_paths
+        for (m, sz, dev) in loaded
     ]
-    avg_y = sum(p["pred_y"] for p in preds) / len(preds)
-    avg_top = sum(p["pred_y_top"] for p in preds) / len(preds)
+    avg_y = sum(w * p["pred_y"] for w, p in zip(norm_weights, preds))
+    avg_top = sum(w * p["pred_y_top"] for w, p in zip(norm_weights, preds))
     return {
         "pred_y": avg_y,
         "pred_y_top": avg_top,

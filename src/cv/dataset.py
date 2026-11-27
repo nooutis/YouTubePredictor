@@ -21,11 +21,12 @@ IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 UNK_TOKEN = "<UNK>"
 
 
-def build_vocab(values: pd.Series) -> dict[str, int]:
-    """Build a string-to-index mapping reserving index 0 for unknown values."""
+def build_vocab(values: pd.Series, min_freq: int = 1) -> dict[str, int]:
+    """Build a string-to-index mapping reserving index 0 for unknown/rare values."""
     vocab: dict[str, int] = {UNK_TOKEN: 0}
-    for val in values.fillna(UNK_TOKEN).astype(str).unique():
-        if val not in vocab:
+    counts = values.fillna(UNK_TOKEN).astype(str).value_counts()
+    for val, freq in counts.items():
+        if val != UNK_TOKEN and int(freq) >= min_freq and val not in vocab:
             vocab[val] = len(vocab)
     return vocab
 
@@ -52,14 +53,14 @@ class LetterboxPad:
 def resolve_normalization(
     model_name: str,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
-    """Return the `(mean, std)` expected by a `timm` backbone (e.g., SigLIP vs ImageNet)."""
+    """Return the `(mean, std)` expected by a `timm` backbone without instantiating it."""
     try:
-        model = timm.create_model(model_name, pretrained=False)
-        data_cfg = timm.data.resolve_model_data_config(model)
-        mean = tuple(float(x) for x in data_cfg["mean"])
-        std = tuple(float(x) for x in data_cfg["std"])
-        if len(mean) == 3 and len(std) == 3:
-            return mean, std  # type: ignore[return-value]
+        cfg = timm.models.get_pretrained_cfg(model_name)
+        if cfg is not None and cfg.mean and cfg.std:
+            mean = tuple(float(x) for x in cfg.mean)
+            std = tuple(float(x) for x in cfg.std)
+            if len(mean) == 3 and len(std) == 3:
+                return mean, std  # type: ignore[return-value]
     except Exception:
         pass
     return IMAGENET_MEAN, IMAGENET_STD

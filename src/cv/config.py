@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import yaml
 
-# Defaults tuned for an initial baseline on a Kaggle GPU (T4/P100).
+# Defaults tuned for an initial baseline on a Kaggle GPU (T4/P100) or TPU.
 IMG_SIZE: int = 224
 BATCH_SIZE: int = 32
 LR: float = 3e-4
@@ -24,12 +24,33 @@ DEFAULT_EXPERIMENTS_YAML: Path = Path("configs/cv_experiments.yaml")
 
 
 def default_device() -> str:
-    """Pick the best available compute device: CUDA first, then Apple MPS, then CPU."""
+    """Pick the best available compute device: Kaggle TPU (XLA) -> CUDA -> MPS -> CPU."""
+    try:
+        import torch_xla.core.xla_model as xm  # type: ignore[import-not-found]
+
+        _ = xm.xla_device()
+        return "xla"
+    except Exception:
+        pass
     if torch.cuda.is_available():
         return "cuda"
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def resolve_torch_device(device_str: str) -> tuple[torch.device, object | None]:
+    """Resolve `xla`/`tpu`, `cuda`, `mps`, or `cpu` into a torch.device (and optional xm)."""
+    if device_str.lower() in {"xla", "tpu"}:
+        try:
+            import torch_xla.core.xla_model as xm  # type: ignore[import-not-found]
+
+            return xm.xla_device(), xm
+        except Exception as exc:
+            print(f"[Device] TPU/XLA requested but unavailable ({exc}); falling back.")
+            fallback = "cuda" if torch.cuda.is_available() else "cpu"
+            return torch.device(fallback), None
+    return torch.device(device_str), None
 
 
 def seed_everything(seed: int = SEED) -> None:
@@ -47,8 +68,10 @@ class CVConfig:
     """Paths, CSV schema, model settings, and training hyperparameters."""
 
     # Default Kaggle paths; override these when running locally.
-    splits_csv: Path = Path("/kaggle/input/youtube-predictor-data/splits.csv")
-    images_dir: Path = Path("/kaggle/input/youtube-predictor-data/thumbnails")
+    splits_csv: Path = Path("/kaggle/working/YouTubePredictor/data/split.csv")
+    images_dir: Path = Path(
+        "/kaggle/input/datasets/charlottecarretta/youtube-datased-cleaned-with-images/thumbnails"
+    )
     output_dir: Path = Path("/kaggle/working/outputs")
 
     # Image preprocessing and DataLoader settings.
@@ -73,6 +96,7 @@ class CVConfig:
     use_metadata: bool = True
     channel_emb_dim: int = 32
     category_emb_dim: int = 16
+    channel_min_freq: int = 3
 
     # Multi-task loss and target scaling settings.
     cls_loss_weight: float = 1.0
@@ -80,9 +104,12 @@ class CVConfig:
     standardize_y: bool = True
     auto_pos_weight: bool = True
 
-    # Fine-tuning schedule: freeze backbone first, then unfreeze with differential LR.
+    # Fine-tuning schedule: freeze backbone first, then unfreeze with warmup + differential LR.
     freeze_epochs: int = 2
+    warmup_epochs: int = 1
     backbone_lr_mult: float = 0.1
+    grad_clip_norm: float = 1.0
+    early_stopping_patience: int = 4
 
     # AdamW optimizer settings and training schedule length.
     lr: float = LR
