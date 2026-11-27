@@ -160,3 +160,34 @@ def predict(
         channel_title=channel_title,
         category=category,
     )
+
+
+def predict_ensemble(
+    image: str | Path | Image.Image,
+    weights_paths: list[str | Path],
+    threshold: float = 0.5,
+    device: Optional[str] = None,
+    channel_title: Optional[str] = None,
+    category: Optional[str] = None,
+) -> dict[str, float | int]:
+    """Average `pred_y` and `pred_y_top` across multiple fold checkpoints."""
+    if not weights_paths:
+        raise ValueError("Provide at least one checkpoint path in `weights_paths`.")
+
+    preds = [
+        predict_thumbnail(
+            image=image,
+            weights_path=wp,
+            device=device,
+            channel_title=channel_title,
+            category=category,
+        )
+        for wp in weights_paths
+    ]
+    avg_y = sum(p["pred_y"] for p in preds) / len(preds)
+    avg_top = sum(p["pred_y_top"] for p in preds) / len(preds)
+    return {
+        "pred_y": avg_y,
+        "pred_y_top": avg_top,
+        "pred_y_top_label": int(avg_top >= threshold),
+    }
