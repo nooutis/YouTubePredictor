@@ -1,4 +1,4 @@
-"""PyTorch Dataset and image transforms for YouTube thumbnails."""
+"""PyTorch Dataset, metadata vocabulary helpers, and image transforms for YouTube thumbnails."""
 
 from __future__ import annotations
 
@@ -18,6 +18,16 @@ from src.cv.config import IMG_SIZE
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+UNK_TOKEN = "<UNK>"
+
+
+def build_vocab(values: pd.Series) -> dict[str, int]:
+    """Build a string-to-index mapping reserving index 0 for unknown values."""
+    vocab: dict[str, int] = {UNK_TOKEN: 0}
+    for val in values.fillna(UNK_TOKEN).astype(str).unique():
+        if val not in vocab:
+            vocab[val] = len(vocab)
+    return vocab
 
 
 class LetterboxPad:
@@ -84,7 +94,7 @@ def build_transforms(
 
 
 class ThumbnailDataset(Dataset):
-    """Dataset that reads `splits.csv` and loads thumbnail images with `y` and `y_top`."""
+    """Dataset that reads `splits.csv` and loads thumbnails, targets, and metadata."""
 
     def __init__(
         self,
@@ -95,30 +105,63 @@ class ThumbnailDataset(Dataset):
         id_col: str = "video_id",
         split_col: str = "split",
         image_col: str = "thumbnail_path",
+        channel_col: str = "channel_title",
+        category_col: str = "category",
         target_cols: tuple[str, str] = ("y", "y_top"),
+        channel_vocab: Optional[dict[str, int]] = None,
+        category_vocab: Optional[dict[str, int]] = None,
     ) -> None:
         self.images_dir = Path(images_dir)
         self.split = split
         self.transform = transform or build_transforms(is_train=(split == "train"))
         self.id_col = id_col
         self.image_col = image_col
+        self.channel_col = channel_col
+        self.category_col = category_col
         self.target_cols = target_cols
 
         df = pd.read_csv(splits_csv)
-        # Filter to the requested subset when a split column is present.
         if split_col in df.columns:
             df = df[df[split_col] == split].reset_index(drop=True)
+
+        self.has_targets = all(col in df.columns for col in self.target_cols)
+        if self.has_targets:
+            # Drop any corrupted rows with non-numeric targets and coerce to float.
+            y_num = pd.to_numeric(df[self.target_cols[0]], errors="coerce")
+            y_top_num = pd.to_numeric(df[self.target_cols[1]], errors="coerce")
+            valid_mask = y_num.notna() & y_top_num.notna()
+            dropped = int((~valid_mask).sum())
+            if dropped > 0:
+                print(
+                    f"[ThumbnailDataset:{split}] Dropped {dropped} rows with non-numeric targets."
+                )
+                df = df[valid_mask].reset_index(drop=True)
+                y_num = y_num[valid_mask].reset_index(drop=True)
+                y_top_num = y_top_num[valid_mask].reset_index(drop=True)
+            df[self.target_cols[0]] = y_num.astype(float)
+            df[self.target_cols[1]] = y_top_num.astype(float)
+
         self.df = df
 
-        # Test splits may omit target columns; in that case __getitem__ returns zeros.
-        self.has_targets = all(col in self.df.columns for col in self.target_cols)
+        if channel_vocab is not None:
+            self.channel_vocab = channel_vocab
+        elif channel_col in self.df.columns:
+            self.channel_vocab = build_vocab(self.df[channel_col])
+        else:
+            self.channel_vocab = {UNK_TOKEN: 0}
+
+        if category_vocab is not None:
+            self.category_vocab = category_vocab
+        elif category_col in self.df.columns:
+            self.category_vocab = build_vocab(self.df[category_col])
+        else:
+            self.category_vocab = {UNK_TOKEN: 0}
 
     def __len__(self) -> int:
         return len(self.df)
 
     def _resolve_image_path(self, row: pd.Series) -> Path:
         """Locate the image file from the CSV path column or by trying common extensions."""
-        # Check the explicit path column first (either absolute or relative to images_dir).
         if self.image_col in row and pd.notna(row[self.image_col]):
             candidate = Path(str(row[self.image_col]))
             if candidate.is_file():
@@ -127,7 +170,6 @@ class ThumbnailDataset(Dataset):
             if rel_candidate.is_file():
                 return rel_candidate
 
-        # Fall back to <video_id>.<ext> inside images_dir.
         video_id = str(row[self.id_col])
         for ext in IMAGE_EXTENSIONS:
             candidate = self.images_dir / f"{video_id}{ext}"
@@ -138,12 +180,18 @@ class ThumbnailDataset(Dataset):
             f"Thumbnail not found for video_id={video_id} in {self.images_dir}"
         )
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, str]:
+    def _encode_meta(self, row: pd.Series, col: str, vocab: dict[str, int]) -> int:
+        if col not in row or pd.isna(row[col]):
+            return 0
+        return vocab.get(str(row[col]), 0)
+
+    def __getitem__(
+        self, idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor, str, int, int]:
         row = self.df.iloc[idx]
         video_id = str(row[self.id_col])
         img_path = self._resolve_image_path(row)
 
-        # Convert to RGB so PNGs with alpha channels or grayscale images do not break transforms.
         with Image.open(img_path) as img:
             image = img.convert("RGB")
 
@@ -157,4 +205,6 @@ class ThumbnailDataset(Dataset):
         else:
             targets = torch.zeros(2, dtype=torch.float32)
 
-        return tensor, targets, video_id
+        channel_idx = self._encode_meta(row, self.channel_col, self.channel_vocab)
+        category_idx = self._encode_meta(row, self.category_col, self.category_vocab)
+        return tensor, targets, video_id, channel_idx, category_idx

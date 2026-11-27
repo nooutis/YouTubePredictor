@@ -57,21 +57,32 @@ class CVConfig:
     num_workers: int = 2
     use_hflip: bool = False
 
-    # Expected column names in splits.csv (keep aligned with Persona 1).
+    # Expected column names in splits.csv.
     id_col: str = "video_id"
     split_col: str = "split"
     image_col: str = "thumbnail_path"
+    channel_col: str = "channel_title"
+    category_col: str = "category"
     target_cols: tuple[str, str] = ("y", "y_top")
 
-    # Backbone name from timm and two-branch MLP head settings.
+    # Backbone name from timm, multimodal metadata fusion, and two-branch MLP head.
     model_name: str = MODEL_NAME
     pretrained: bool = True
     dropout: float = 0.2
     head_hidden_dim: int = 256
+    use_metadata: bool = True
+    channel_emb_dim: int = 32
+    category_emb_dim: int = 16
 
-    # Multi-task loss settings: SmoothL1 for `y` + weighted BCEWithLogits for `y_top`.
+    # Multi-task loss and target scaling settings.
     cls_loss_weight: float = 1.0
     reg_loss_beta: float = 1.0
+    standardize_y: bool = True
+    auto_pos_weight: bool = True
+
+    # Fine-tuning schedule: freeze backbone first, then unfreeze with differential LR.
+    freeze_epochs: int = 2
+    backbone_lr_mult: float = 0.1
 
     # AdamW optimizer settings and training schedule length.
     lr: float = LR
