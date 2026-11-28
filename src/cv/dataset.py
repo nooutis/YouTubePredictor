@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Optional
 
+import numpy as np
 import pandas as pd
 from PIL import Image, ImageOps
 import timm
@@ -19,6 +20,20 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 UNK_TOKEN = "<UNK>"
+DEFAULT_TABULAR_COLS: tuple[str, ...] = (
+    "log_subscribers",
+    "log_duration",
+    "title_len",
+    "title_n_words",
+    "title_upper_ratio",
+    "title_n_caps_words",
+    "title_n_digits",
+    "title_has_question",
+    "title_has_exclaim",
+    "title_has_emoji",
+    "title_has_brackets",
+    "title_truncated",
+)
 
 
 def build_vocab(values: pd.Series, min_freq: int = 1) -> dict[str, int]:
@@ -66,31 +81,81 @@ def resolve_normalization(
     return IMAGENET_MEAN, IMAGENET_STD
 
 
+def fit_tabular_stats(
+    df: pd.DataFrame, tab_cols: list[str]
+) -> dict[str, list[float]]:
+    """Compute per-column train medians, means, and stds without validation leakage."""
+    medians: list[float] = []
+    means: list[float] = []
+    stds: list[float] = []
+    for col in tab_cols:
+        series = pd.to_numeric(df[col], errors="coerce")
+        med = float(series.median()) if series.notna().any() else 0.0
+        filled = series.fillna(med).to_numpy(dtype=np.float64)
+        mean = float(filled.mean()) if len(filled) > 0 else 0.0
+        std = max(float(filled.std()), 1e-6) if len(filled) > 0 else 1.0
+        medians.append(med)
+        means.append(mean)
+        stds.append(std)
+    return {"median": medians, "mean": means, "std": stds}
+
+
 def build_transforms(
     img_size: int = IMG_SIZE,
     is_train: bool = True,
     use_hflip: bool = False,
     mean: tuple[float, float, float] = IMAGENET_MEAN,
     std: tuple[float, float, float] = IMAGENET_STD,
+    use_letterbox: bool = False,
 ) -> Callable:
     """Build the torchvision transform pipeline for training or validation/inference.
 
-    Preserves 16:9 thumbnail aspect ratio via letterbox padding and uses
-    model-specific normalization statistics.
+    When `use_letterbox` is False (default), uses direct resize / gentle
+    RandomResizedCrop so thumbnail text and faces occupy the full resolution
+    without grey padding bars.
     """
-    ops: list[Callable] = [LetterboxPad(img_size)]
-    if is_train:
-        if use_hflip:
-            ops.append(transforms.RandomHorizontalFlip(p=0.5))
-        ops.append(
-            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1)
-        )
+    ops: list[Callable] = []
+    if use_letterbox:
+        ops.append(LetterboxPad(img_size))
+        if is_train:
+            if use_hflip:
+                ops.append(transforms.RandomHorizontalFlip(p=0.5))
+            ops.append(
+                transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1)
+            )
+    else:
+        if is_train:
+            ops.append(
+                transforms.RandomResizedCrop(
+                    img_size,
+                    scale=(0.88, 1.0),
+                    ratio=(1.3, 1.9),
+                    interpolation=transforms.InterpolationMode.BICUBIC,
+                )
+            )
+            if use_hflip:
+                ops.append(transforms.RandomHorizontalFlip(p=0.5))
+            ops.append(
+                transforms.ColorJitter(
+                    brightness=0.2, contrast=0.2, saturation=0.15, hue=0.02
+                )
+            )
+        else:
+            ops.append(
+                transforms.Resize(
+                    (img_size, img_size),
+                    interpolation=transforms.InterpolationMode.BICUBIC,
+                )
+            )
+
     ops.extend(
         [
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ]
     )
+    if is_train and not use_letterbox:
+        ops.append(transforms.RandomErasing(p=0.15, scale=(0.02, 0.1)))
     return transforms.Compose(ops)
 
 
@@ -111,6 +176,9 @@ class ThumbnailDataset(Dataset):
         target_cols: tuple[str, str] = ("y", "y_top"),
         channel_vocab: Optional[dict[str, int]] = None,
         category_vocab: Optional[dict[str, int]] = None,
+        features_csv: Optional[str | Path] = None,
+        tabular_cols: Optional[list[str]] = None,
+        tabular_stats: Optional[dict[str, list[float]]] = None,
     ) -> None:
         self.images_dir = Path(images_dir)
         self.split = split
@@ -142,7 +210,45 @@ class ThumbnailDataset(Dataset):
             df[self.target_cols[0]] = y_num.astype(float)
             df[self.target_cols[1]] = y_top_num.astype(float)
 
+        if features_csv is not None and Path(features_csv).is_file():
+            feat_df = pd.read_csv(features_csv)
+            if self.id_col in feat_df.columns:
+                feat_df = feat_df.drop_duplicates(subset=[self.id_col])
+                new_cols = [
+                    c for c in feat_df.columns if c == self.id_col or c not in df.columns
+                ]
+                df = df.merge(feat_df[new_cols], on=self.id_col, how="left")
+
         self.df = df
+
+        if tabular_cols is not None:
+            self.tabular_cols = [c for c in tabular_cols if c in self.df.columns]
+        elif features_csv is not None and Path(features_csv).is_file():
+            self.tabular_cols = [c for c in DEFAULT_TABULAR_COLS if c in self.df.columns]
+        else:
+            self.tabular_cols = []
+
+        if self.tabular_cols:
+            if tabular_stats is None:
+                self.tabular_stats = fit_tabular_stats(self.df, self.tabular_cols)
+            else:
+                self.tabular_stats = tabular_stats
+
+            mat = np.zeros((len(self.df), len(self.tabular_cols)), dtype=np.float32)
+            for j, col in enumerate(self.tabular_cols):
+                med = self.tabular_stats["median"][j]
+                mean = self.tabular_stats["mean"][j]
+                std = self.tabular_stats["std"][j]
+                vals = (
+                    pd.to_numeric(self.df[col], errors="coerce")
+                    .fillna(med)
+                    .to_numpy(dtype=np.float64)
+                )
+                mat[:, j] = ((vals - mean) / std).astype(np.float32)
+            self.tabular_matrix = mat
+        else:
+            self.tabular_stats = None
+            self.tabular_matrix = np.zeros((len(self.df), 0), dtype=np.float32)
 
         if channel_vocab is not None:
             self.channel_vocab = channel_vocab
@@ -188,7 +294,7 @@ class ThumbnailDataset(Dataset):
 
     def __getitem__(
         self, idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor, str, int, int]:
+    ) -> tuple[torch.Tensor, torch.Tensor, str, int, int, torch.Tensor]:
         row = self.df.iloc[idx]
         video_id = str(row[self.id_col])
         img_path = self._resolve_image_path(row)
@@ -208,4 +314,5 @@ class ThumbnailDataset(Dataset):
 
         channel_idx = self._encode_meta(row, self.channel_col, self.channel_vocab)
         category_idx = self._encode_meta(row, self.category_col, self.category_vocab)
-        return tensor, targets, video_id, channel_idx, category_idx
+        tabular_tensor = torch.tensor(self.tabular_matrix[idx], dtype=torch.float32)
+        return tensor, targets, video_id, channel_idx, category_idx, tabular_tensor

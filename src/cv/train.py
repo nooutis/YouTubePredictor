@@ -89,9 +89,71 @@ def _roc_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return (pos_rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
 
 
-def _set_backbone_trainable(model: ThumbnailRegressor, trainable: bool) -> None:
+def _set_backbone_trainable(
+    model: ThumbnailRegressor,
+    trainable: bool,
+    unfreeze_last_n_blocks: int = 0,
+) -> None:
+    """Freeze or partially/fully unfreeze the vision backbone."""
     for param in model.backbone.parameters():
-        param.requires_grad = trainable
+        param.requires_grad = False
+    if not trainable:
+        return
+
+    if unfreeze_last_n_blocks <= 0:
+        for param in model.backbone.parameters():
+            param.requires_grad = True
+        return
+
+    blocks = getattr(model.backbone, "blocks", None)
+    stages = getattr(model.backbone, "stages", None)
+    if blocks is not None and hasattr(blocks, "__len__"):
+        n_blocks = min(unfreeze_last_n_blocks, len(blocks))
+        for block in blocks[-n_blocks:]:
+            for param in block.parameters():
+                param.requires_grad = True
+        for attr in ("norm", "attn_pool", "fc_norm", "head_drop", "head"):
+            mod = getattr(model.backbone, attr, None)
+            if mod is not None and isinstance(mod, nn.Module):
+                for param in mod.parameters():
+                    param.requires_grad = True
+        return
+
+    if stages is not None and hasattr(stages, "__len__"):
+        n_stages = min(unfreeze_last_n_blocks, len(stages))
+        for stage in stages[-n_stages:]:
+            for param in stage.parameters():
+                param.requires_grad = True
+        for attr in ("norm_pre", "head"):
+            mod = getattr(model.backbone, attr, None)
+            if mod is not None and isinstance(mod, nn.Module):
+                for param in mod.parameters():
+                    param.requires_grad = True
+        return
+
+    for param in model.backbone.parameters():
+        param.requires_grad = True
+
+
+def _is_better_metric(
+    candidate: float, best: float, selection_metric: str
+) -> bool:
+    """Compare validation metrics according to metric direction."""
+    if selection_metric == "val_pearson":
+        return candidate > best
+    return candidate < best
+
+
+def _resolve_features_csv(config: CVConfig) -> Optional[Path]:
+    """Locate `features.csv` from config or alongside `splits_csv`."""
+    if not config.use_tabular:
+        return None
+    if config.features_csv is not None and config.features_csv.is_file():
+        return config.features_csv
+    sibling = config.splits_csv.parent / "features.csv"
+    if sibling.is_file():
+        return sibling
+    return None
 
 
 def _cosine_warmup_lambda(
@@ -120,6 +182,7 @@ def train_one_epoch(
     scaler: Optional[torch.amp.GradScaler] = None,
     xm: object | None = None,
     grad_clip_norm: float = 1.0,
+    grad_accum_steps: int = 1,
     log_interval: Optional[int] = None,
 ) -> float:
     """Run one training epoch and return the sample-weighted average total loss."""
@@ -127,38 +190,59 @@ def train_one_epoch(
     running_loss_t = torch.zeros((), dtype=torch.float32, device=device)
     total_samples = 0
     num_batches = max(len(loader), 1)
+    accum = max(int(grad_accum_steps), 1)
     step_log = log_interval or max(1, num_batches // 4)
     t0 = time.perf_counter()
 
-    for step, (images, targets, _, channel_idx, category_idx) in enumerate(loader, start=1):
+    optimizer.zero_grad(set_to_none=True)
+
+    for step, (images, targets, _, channel_idx, category_idx, tabular) in enumerate(
+        loader, start=1
+    ):
         if xm is None:
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
             channel_idx = channel_idx.to(device, non_blocking=True)
             category_idx = category_idx.to(device, non_blocking=True)
+            tabular = tabular.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
+        should_step = (step % accum == 0) or (step == num_batches)
 
         if scaler is not None:
             with torch.amp.autocast(device_type=device.type):
-                preds = model(images, channel_idx=channel_idx, category_idx=category_idx)
+                preds = model(
+                    images,
+                    channel_idx=channel_idx,
+                    category_idx=category_idx,
+                    tabular=tabular,
+                )
                 loss, _, _ = criterion(preds, targets, y_mean=y_mean, y_std=y_std)
-            scaler.scale(loss).backward()
-            if grad_clip_norm > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-            scaler.step(optimizer)
-            scaler.update()
+                scaled_loss = loss / float(accum)
+            scaler.scale(scaled_loss).backward()
+            if should_step:
+                if grad_clip_norm > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
         else:
-            preds = model(images, channel_idx=channel_idx, category_idx=category_idx)
+            preds = model(
+                images,
+                channel_idx=channel_idx,
+                category_idx=category_idx,
+                tabular=tabular,
+            )
             loss, _, _ = criterion(preds, targets, y_mean=y_mean, y_std=y_std)
-            loss.backward()
-            if grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-            if xm is not None:
-                xm.optimizer_step(optimizer, barrier=True)  # type: ignore[attr-defined]
-            else:
-                optimizer.step()
+            (loss / float(accum)).backward()
+            if should_step:
+                if grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                if xm is not None:
+                    xm.optimizer_step(optimizer, barrier=True)  # type: ignore[attr-defined]
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
         batch_size = images.size(0)
         running_loss_t = running_loss_t + loss.detach() * batch_size
@@ -200,14 +284,20 @@ def validate(
     all_top_prob: list[np.ndarray] = []
     records: list[dict[str, float | str]] = []
 
-    for images, targets, video_ids, channel_idx, category_idx in loader:
+    for images, targets, video_ids, channel_idx, category_idx, tabular in loader:
         if xm is None:
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
             channel_idx = channel_idx.to(device, non_blocking=True)
             category_idx = category_idx.to(device, non_blocking=True)
+            tabular = tabular.to(device, non_blocking=True)
 
-        preds = model(images, channel_idx=channel_idx, category_idx=category_idx)
+        preds = model(
+            images,
+            channel_idx=channel_idx,
+            category_idx=category_idx,
+            tabular=tabular,
+        )
         loss, reg_loss, cls_loss = criterion(preds, targets, y_mean=y_mean, y_std=y_std)
         if xm is not None:
             xm.mark_step()  # type: ignore[attr-defined]
@@ -249,12 +339,19 @@ def validate(
     top_prob_cat = np.concatenate(all_top_prob) if all_top_prob else np.array([])
 
     denom = max(total_samples, 1)
+    mae = float(np.abs(y_true_cat - y_pred_cat).mean()) if len(y_true_cat) else 0.0
+    rmse = (
+        float(np.sqrt(np.mean((y_true_cat - y_pred_cat) ** 2)))
+        if len(y_true_cat)
+        else 0.0
+    )
     metrics = {
         "val_loss": running_loss / denom,
         "val_reg_loss": running_reg / denom,
         "val_cls_loss": running_cls / denom,
         "val_top_acc": correct_top / denom,
-        "val_mae": float(np.abs(y_true_cat - y_pred_cat).mean()) if len(y_true_cat) else 0.0,
+        "val_mae": mae,
+        "val_rmse": rmse,
         "val_pearson": _pearson_corr(y_true_cat, y_pred_cat),
         "val_auc": _roc_auc(top_true_cat, top_prob_cat),
     }
@@ -269,6 +366,7 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
     norm_mean, norm_std = resolve_normalization(config.model_name)
+    features_csv = _resolve_features_csv(config)
 
     train_ds = ThumbnailDataset(
         splits_csv=config.splits_csv,
@@ -280,6 +378,7 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
             use_hflip=config.use_hflip,
             mean=norm_mean,
             std=norm_std,
+            use_letterbox=config.use_letterbox,
         ),
         id_col=config.id_col,
         split_col=config.split_col,
@@ -287,6 +386,7 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
         channel_col=config.channel_col,
         category_col=config.category_col,
         target_cols=config.target_cols,
+        features_csv=features_csv,
     )
     # Apply min_freq filtering to channel_vocab so rare channels train the <UNK> embedding.
     if config.channel_col in train_ds.df.columns and config.channel_min_freq > 1:
@@ -294,7 +394,7 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
             train_ds.df[config.channel_col], min_freq=config.channel_min_freq
         )
 
-    # Reuse train vocabularies on validation to avoid data leakage.
+    # Reuse train vocabularies and tabular stats on validation to avoid data leakage.
     val_ds = ThumbnailDataset(
         splits_csv=config.splits_csv,
         images_dir=config.images_dir,
@@ -304,6 +404,7 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
             is_train=False,
             mean=norm_mean,
             std=norm_std,
+            use_letterbox=config.use_letterbox,
         ),
         id_col=config.id_col,
         split_col=config.split_col,
@@ -313,6 +414,9 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
         target_cols=config.target_cols,
         channel_vocab=train_ds.channel_vocab,
         category_vocab=train_ds.category_vocab,
+        features_csv=features_csv,
+        tabular_cols=train_ds.tabular_cols,
+        tabular_stats=train_ds.tabular_stats,
     )
 
     if config.standardize_y and train_ds.has_targets and len(train_ds) > 0:
@@ -358,12 +462,16 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
         model_name=config.model_name,
         pretrained=config.pretrained,
         dropout=config.dropout,
+        drop_path_rate=config.drop_path_rate,
         head_hidden_dim=config.head_hidden_dim,
         use_metadata=config.use_metadata,
+        use_channel_emb=config.use_channel_emb,
         num_channels=len(train_ds.channel_vocab),
         num_categories=len(train_ds.category_vocab),
         channel_emb_dim=config.channel_emb_dim,
         category_emb_dim=config.category_emb_dim,
+        num_tabular_features=len(train_ds.tabular_cols),
+        tabular_hidden_dim=config.tabular_hidden_dim,
     ).to(device)
 
     criterion = MultiTaskLoss(
@@ -399,14 +507,19 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
     pos_w_val = float(pos_weight_tensor.item()) if pos_weight_tensor is not None else 1.0
     print(
         f"[Config] model={config.model_name} | device={device} (xla={xm is not None}) | "
-        f"img={config.img_size} | bs={config.batch_size} | epochs={config.epochs} | "
-        f"train={len(train_ds)} | val={len(val_ds)} | channels={len(train_ds.channel_vocab)} "
-        f"(min_freq={config.channel_min_freq}) | categories={len(train_ds.category_vocab)} | "
-        f"y_mean={y_mean:.3f} y_std={y_std:.3f} | pos_weight={pos_w_val:.2f} | "
-        f"freeze={config.freeze_epochs} warmup={config.warmup_epochs} patience={config.early_stopping_patience}"
+        f"img={config.img_size} | letterbox={config.use_letterbox} | "
+        f"bs={config.batch_size}x{config.grad_accum_steps} | epochs={config.epochs} | "
+        f"train={len(train_ds)} | val={len(val_ds)} | use_ch={config.use_channel_emb} | "
+        f"categories={len(train_ds.category_vocab)} | tabular={len(train_ds.tabular_cols)} | "
+        f"y_mean={y_mean:.3f} y_std={y_std:.3f} | cls_w={config.cls_loss_weight} pos_w={pos_w_val:.2f} | "
+        f"freeze={config.freeze_epochs} unfreeze_blocks={config.unfreeze_last_n_blocks} | "
+        f"select={config.selection_metric} patience={config.early_stopping_patience}"
     )
 
-    best_val_loss = float("inf")
+    selection_metric = config.selection_metric
+    best_score = (
+        float("-inf") if selection_metric == "val_pearson" else float("inf")
+    )
     epochs_no_improve = 0
     best_weights_path = config.output_dir / "best_model.pt"
     best_preds_path = config.output_dir / "val_predictions.csv"
@@ -414,10 +527,19 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
     for epoch in range(1, config.epochs + 1):
         epoch_t0 = time.perf_counter()
         if config.freeze_epochs > 0 and epoch == config.freeze_epochs + 1:
-            _set_backbone_trainable(model, True)
+            _set_backbone_trainable(
+                model,
+                True,
+                unfreeze_last_n_blocks=config.unfreeze_last_n_blocks,
+            )
+            trainable_backbone = sum(
+                p.numel() for p in model.backbone.parameters() if p.requires_grad
+            )
+            total_backbone = sum(p.numel() for p in model.backbone.parameters())
             print(
-                f"Epoch {epoch:02d}: Unfreezing backbone with "
-                f"backbone_lr={optimizer.param_groups[0]['lr']:.2e}, "
+                f"Epoch {epoch:02d}: Unfreezing backbone "
+                f"({trainable_backbone:,}/{total_backbone:,} params, last_n={config.unfreeze_last_n_blocks}) "
+                f"with backbone_lr={optimizer.param_groups[0]['lr']:.2e}, "
                 f"head_lr={optimizer.param_groups[1]['lr']:.2e}"
             )
 
@@ -432,26 +554,28 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
             scaler=scaler,
             xm=xm,
             grad_clip_norm=config.grad_clip_norm,
+            grad_accum_steps=config.grad_accum_steps,
         )
         metrics, val_preds_df = validate(
             model, val_loader, criterion, device, y_mean=y_mean, y_std=y_std, xm=xm
         )
         scheduler.step()
 
-        val_loss = metrics["val_loss"]
-        is_best = val_loss < best_val_loss
+        current_score = metrics.get(selection_metric, metrics["val_mae"])
+        is_best = _is_better_metric(current_score, best_score, selection_metric)
         epoch_dt = time.perf_counter() - epoch_t0
         print(
             f"Epoch {epoch:02d}/{config.epochs:02d} ({epoch_dt:.1f}s) | "
-            f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} "
+            f"train_loss={train_loss:.4f} | val_loss={metrics['val_loss']:.4f} "
             f"(reg={metrics['val_reg_loss']:.4f}, cls={metrics['val_cls_loss']:.4f}) | "
-            f"mae={metrics['val_mae']:.4f} | r={metrics['val_pearson']:.3f} | "
-            f"auc={metrics['val_auc']:.3f} | acc={metrics['val_top_acc']:.3f}"
+            f"mae={metrics['val_mae']:.4f} | rmse={metrics['val_rmse']:.4f} | "
+            f"r={metrics['val_pearson']:.3f} | auc={metrics['val_auc']:.3f} | "
+            f"acc={metrics['val_top_acc']:.3f}"
             + (" | [*] BEST" if is_best else "")
         )
 
         if is_best:
-            best_val_loss = val_loss
+            best_score = current_score
             epochs_no_improve = 0
             cpu_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
             torch.save(
@@ -459,18 +583,30 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
                     "model_name": config.model_name,
                     "img_size": config.img_size,
                     "dropout": config.dropout,
+                    "drop_path_rate": config.drop_path_rate,
                     "head_hidden_dim": config.head_hidden_dim,
                     "use_metadata": config.use_metadata,
+                    "use_channel_emb": config.use_channel_emb,
                     "channel_vocab": train_ds.channel_vocab,
                     "category_vocab": train_ds.category_vocab,
                     "channel_emb_dim": config.channel_emb_dim,
                     "category_emb_dim": config.category_emb_dim,
+                    "tabular_cols": train_ds.tabular_cols,
+                    "tabular_stats": train_ds.tabular_stats,
+                    "tabular_hidden_dim": config.tabular_hidden_dim,
+                    "use_letterbox": config.use_letterbox,
                     "y_mean": y_mean,
                     "y_std": y_std,
                     "norm_mean": list(norm_mean),
                     "norm_std": list(norm_std),
                     "state_dict": cpu_state,
-                    "val_loss": best_val_loss,
+                    "selection_metric": selection_metric,
+                    "best_score": best_score,
+                    "val_loss": metrics["val_loss"],
+                    "val_mae": metrics["val_mae"],
+                    "val_rmse": metrics["val_rmse"],
+                    "val_pearson": metrics["val_pearson"],
+                    "val_auc": metrics["val_auc"],
                     "epoch": epoch,
                 },
                 best_weights_path,
@@ -484,12 +620,12 @@ def run_training(config: CVConfig) -> tuple[Path, Path]:
             ):
                 print(
                     f"Early stopping at epoch {epoch:02d} "
-                    f"(no val_loss improvement for {epochs_no_improve} epochs)."
+                    f"(no {selection_metric} improvement for {epochs_no_improve} epochs)."
                 )
                 break
 
     print(
-        f"Training complete. Best val_loss={best_val_loss:.4f} | "
+        f"Training complete. Best {selection_metric}={best_score:.4f} | "
         f"weights={best_weights_path} | predictions={best_preds_path}"
     )
     return best_weights_path, best_preds_path
@@ -503,7 +639,7 @@ def parse_args() -> argparse.Namespace:
         "--experiment",
         type=str,
         default="baseline_cnn",
-        help="Experiment key in configs/cv_experiments.yaml (e.g., convnext_tiny, finetuning_siglip).",
+        help="Experiment key in configs/cv_experiments.yaml (e.g., convnext_tiny, finetuning_siglip_384).",
     )
     parser.add_argument(
         "--config-path",
@@ -512,12 +648,15 @@ def parse_args() -> argparse.Namespace:
         help="Path to the experiments YAML file.",
     )
     parser.add_argument("--splits-csv", type=Path, default=None)
+    parser.add_argument("--features-csv", type=Path, default=None)
     parser.add_argument("--images-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--selection-metric", type=str, default=None)
+    parser.add_argument("--unfreeze-last-n-blocks", type=int, default=None)
     return parser.parse_args()
 
 
@@ -527,12 +666,15 @@ def main() -> None:
         experiment_name=args.experiment,
         yaml_path=args.config_path,
         splits_csv=args.splits_csv,
+        features_csv=args.features_csv,
         images_dir=args.images_dir,
         output_dir=args.output_dir,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         device=args.device,
+        selection_metric=args.selection_metric,
+        unfreeze_last_n_blocks=args.unfreeze_last_n_blocks,
     )
     run_training(config)
 

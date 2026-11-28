@@ -33,8 +33,40 @@ experiments:
     model_name: vit_base_patch16_siglip_224
     img_size: 224
     batch_size: 16
-    lr: 0.00005
+    grad_accum_steps: 1
+    lr: 0.0003
+    backbone_lr_mult: 0.003333
+    weight_decay: 0.05
+    drop_path_rate: 0.1
+    unfreeze_last_n_blocks: 3
+    freeze_epochs: 2
+    warmup_epochs: 1
     epochs: 12
+    cls_loss_weight: 0.15
+    auto_pos_weight: false
+    selection_metric: val_mae
+    use_letterbox: false
     seed: 42
     use_hflip: false
-    notes: "Fine-tuning Vision-Language SigLIP backbone on Kaggle GPU"
+    notes: "Multimodal SigLIP-224 regression-primary with partial unfreeze (last 3 blocks) + features.csv"
+
+  finetuning_siglip_384:
+    model_name: vit_base_patch16_siglip_384
+    img_size: 384
+    batch_size: 8
+    grad_accum_steps: 2
+    lr: 0.0003
+    backbone_lr_mult: 0.003333
+    weight_decay: 0.05
+    drop_path_rate: 0.1
+    unfreeze_last_n_blocks: 3
+    freeze_epochs: 2
+    warmup_epochs: 1
+    epochs: 12
+    cls_loss_weight: 0.15
+    auto_pos_weight: false
+    selection_metric: val_mae
+    use_letterbox: false
+    seed: 42
+    use_hflip: false
+    notes: "Multimodal SigLIP-384 regression-primary with partial unfreeze (last 3 blocks) + features.csv"

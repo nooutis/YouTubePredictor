@@ -7,7 +7,7 @@ between local runs and Kaggle, or when changing settings across experiments.
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 import random
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -69,6 +69,7 @@ class CVConfig:
 
     # Default Kaggle paths; override these when running locally.
     splits_csv: Path = Path("/kaggle/working/YouTubePredictor/data/split.csv")
+    features_csv: Optional[Path] = Path("/kaggle/working/YouTubePredictor/data/features.csv")
     images_dir: Path = Path(
         "/kaggle/input/datasets/charlottecarretta/youtube-datased-cleaned-with-images/thumbnails"
     )
@@ -79,6 +80,7 @@ class CVConfig:
     batch_size: int = BATCH_SIZE
     num_workers: int = 2
     use_hflip: bool = False
+    use_letterbox: bool = False
 
     # Expected column names in splits.csv.
     id_col: str = "video_id"
@@ -92,28 +94,35 @@ class CVConfig:
     model_name: str = MODEL_NAME
     pretrained: bool = True
     dropout: float = 0.2
+    drop_path_rate: float = 0.1
     head_hidden_dim: int = 256
     use_metadata: bool = True
+    use_channel_emb: bool = False
+    use_tabular: bool = True
+    tabular_hidden_dim: int = 64
     channel_emb_dim: int = 32
     category_emb_dim: int = 16
     channel_min_freq: int = 3
 
-    # Multi-task loss and target scaling settings.
-    cls_loss_weight: float = 1.0
+    # Multi-task loss and target scaling settings (regression-primary).
+    cls_loss_weight: float = 0.15
     reg_loss_beta: float = 1.0
     standardize_y: bool = True
-    auto_pos_weight: bool = True
+    auto_pos_weight: bool = False
 
-    # Fine-tuning schedule: freeze backbone first, then unfreeze with warmup + differential LR.
+    # Fine-tuning schedule: freeze backbone first, then partial unfreeze with warmup + differential LR.
     freeze_epochs: int = 2
     warmup_epochs: int = 1
     backbone_lr_mult: float = 0.1
+    unfreeze_last_n_blocks: int = 3
+    grad_accum_steps: int = 1
     grad_clip_norm: float = 1.0
     early_stopping_patience: int = 4
+    selection_metric: str = "val_mae"
 
     # AdamW optimizer settings and training schedule length.
     lr: float = LR
-    weight_decay: float = 1e-2
+    weight_decay: float = 0.05
     epochs: int = EPOCHS
     seed: int = SEED
     device: str = field(default_factory=default_device)
@@ -121,6 +130,7 @@ class CVConfig:
     def __post_init__(self) -> None:
         # Normalize string paths passed by callers into Path objects.
         self.splits_csv = Path(self.splits_csv)
+        self.features_csv = Path(self.features_csv) if self.features_csv is not None else None
         self.images_dir = Path(self.images_dir)
         self.output_dir = Path(self.output_dir)
 
